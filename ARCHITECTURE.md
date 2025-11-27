@@ -1,0 +1,279 @@
+# Munition Architecture
+
+This document describes the architecture of the Munition capability attenuation framework.
+
+## Overview
+
+Munition provides sandboxed execution of WASM modules with three core guarantees:
+
+1. **Bounded Execution**: All executions terminate (via fuel exhaustion)
+2. **Memory Isolation**: No state leaks between executions
+3. **Forensic Capture**: Failure state is preserved for analysis
+
+## Component Diagram
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                           Public API                               │
+│                         Munition.fire/4                            │
+└─────────────────────────────────┬──────────────────────────────────┘
+                                  │
+┌─────────────────────────────────▼──────────────────────────────────┐
+│                       Instance Manager                             │
+│                   Munition.Instance.Manager                        │
+│                                                                    │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────────┐ │
+│  │   Compile    │→ │ Instantiate  │→ │       Execute            │ │
+│  └──────────────┘  └──────────────┘  └──────────────────────────┘ │
+│          │                │                      │                 │
+│          ▼                ▼                      ▼                 │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │                    Forensic Capture                          │ │
+│  │                 (on any failure path)                        │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────┬──────────────────────────────────┘
+                                  │
+┌─────────────────────────────────▼──────────────────────────────────┐
+│                      Runtime Behaviour                             │
+│                     Munition.Runtime                               │
+│                                                                    │
+│  ┌────────────────────┐  ┌────────────────────┐                   │
+│  │  Wasmex (default)  │  │  (future runtimes) │                   │
+│  │   via Wasmtime     │  │                    │                   │
+│  └────────────────────┘  └────────────────────┘                   │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+## Module Structure
+
+### Public API (`lib/munition.ex`)
+
+The main entry point. Provides:
+- `fire/4`: Execute WASM function with options
+- `fire_pooled/4`: Execute using instance pool (future)
+- `validate/2`: Validate WASM module
+
+### Instance Management (`lib/munition/instance/`)
+
+**Manager** (`manager.ex`):
+- Orchestrates the compile → instantiate → execute → cleanup lifecycle
+- Ensures forensic capture on any failure path
+- Manages execution timeout (via Task supervision)
+
+**State** (`state.ex`):
+- Tracks instance lifecycle state
+- Used by future pooling implementation
+
+### Runtime Abstraction (`lib/munition/runtime/`)
+
+**Behaviour** (`behaviour.ex`):
+- Defines the runtime contract
+- Allows pluggable WASM engines
+
+**Wasmex Implementation** (`wasmex.ex`):
+- Default implementation using Wasmex/Wasmtime
+- Handles fuel configuration
+- Translates Wasmtime errors to Munition semantics
+
+**Config** (`config.ex`):
+- Runtime configuration
+- Feature detection
+
+### Forensics (`lib/munition/forensics/`)
+
+**Dump** (`dump.ex`):
+- Structured crash dump format
+- Serialization/deserialization
+- Compressed memory storage
+
+**Capture** (`capture.ex`):
+- Immediate state capture on failure
+- Works even after traps
+
+**Analyser** (`analyser.ex`):
+- Pattern searching
+- String extraction
+- Memory introspection
+
+### Fuel Metering (`lib/munition/fuel/`)
+
+**Policy** (`policy.ex`):
+- Default fuel allocations
+- Complexity-based fuel calculation
+
+**Meter** (`meter.ex`):
+- Consumption tracking
+- Historical statistics
+
+### Host Functions (`lib/munition/host/`)
+
+**Functions** (`functions.ex`):
+- Host function registry
+- Capability-gated access
+
+**Capabilities** (`capabilities.ex`):
+- Capability definitions
+- Validation and expansion
+
+## Execution Flow
+
+### Successful Execution
+
+```
+1. fire(wasm, function, args, opts)
+2. Manager.execute()
+   a. Runtime.compile(wasm) → module_ref
+   b. Runtime.instantiate(module_ref) → instance, store
+   c. Runtime.call(instance, function, args)
+      - Consumes fuel
+      - Returns result
+   d. Build metadata (fuel_remaining, execution_time)
+   e. Runtime.cleanup(instance)
+3. Return {:ok, result, metadata}
+```
+
+### Fuel Exhaustion
+
+```
+1. fire(wasm, function, args, fuel: 100)
+2. Manager.execute()
+   a. Runtime.compile(wasm) → module_ref
+   b. Runtime.instantiate(module_ref) → instance, store
+   c. Runtime.call(instance, function, args)
+      - Fuel exhausted mid-execution
+      - Returns {:error, :fuel_exhausted}
+   d. Capture.capture(instance, store, context)
+      - Captures memory snapshot
+      - Records fuel state
+   e. Runtime.cleanup(instance)
+3. Return {:crash, :fuel_exhausted, forensics}
+```
+
+### WASM Trap
+
+```
+1. fire(wasm, function, args)
+2. Manager.execute()
+   a. Runtime.compile(wasm) → module_ref
+   b. Runtime.instantiate(module_ref) → instance, store
+   c. Runtime.call(instance, function, args)
+      - Trap occurs (unreachable, div-by-zero, etc.)
+      - Returns {:error, :trap, details}
+   d. Capture.capture(instance, store, context)
+      - Memory is still accessible after trap
+      - Captures complete state
+   e. Runtime.cleanup(instance)
+3. Return {:crash, :trap, forensics}
+```
+
+## Isolation Model
+
+### Instance Isolation
+
+Each `fire/4` call creates a completely new WASM instance:
+
+- Fresh linear memory (zero-initialized)
+- Fresh global variables
+- Fresh fuel allocation
+- No shared state with any other execution
+
+This is achieved by:
+1. Not pooling instances (each call compiles and instantiates)
+2. Never reusing stores across executions
+3. No mutable state in the Elixir supervision tree
+
+### Capability Isolation
+
+Host functions are gated by capabilities:
+
+```elixir
+# Only time access granted
+Munition.fire(wasm, "func", [], capabilities: [:time])
+
+# WASM can call get_time_ms()
+# WASM cannot call get_random() - not granted
+```
+
+The capability check happens at import resolution time, not at call time.
+This means:
+- Denied capabilities result in instantiation failure
+- No runtime overhead for capability checks
+- Clear audit trail of what was granted
+
+## Future Work
+
+### Instance Pooling
+
+Pre-compile and pre-instantiate modules for reduced latency:
+
+```elixir
+# Start pool with pre-warmed instances
+Munition.Pool.start_link(:my_plugin, wasm_bytes, size: 10)
+
+# Execute using pooled instance (faster startup)
+Munition.fire_pooled(:my_plugin, "process", [data])
+```
+
+Challenges:
+- Memory reset between executions
+- Fuel reset
+- State clearing
+
+Potential approach:
+- Use Wizer for snapshot-and-restore
+- Or accept compilation overhead and only cache modules
+
+### Alternative Runtimes
+
+The `Munition.Runtime` behaviour allows plugging in different WASM engines:
+
+- **Wasmer**: Alternative to Wasmtime
+- **WAMR**: Lightweight interpreter for constrained environments
+- **Native Lunatic**: When running under Lunatic, use its WASM support
+
+### Additional Attenuators
+
+The framework is designed to support multiple source languages:
+
+1. **Rust → WASM**: Direct, additive isolation
+2. **PHP → WASM**: Via php-wasm (restrictive)
+3. **JavaScript → WASM**: Via AssemblyScript (restrictive)
+4. **Pony → WASM**: Hypothetical, capability-preserving
+
+Each attenuator would be a separate project that produces WASM
+compatible with Munition's execution model.
+
+## Security Considerations
+
+### Trust Boundaries
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Trusted (Elixir)                     │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │              Munition Framework                  │   │
+│  │  ┌───────────────────────────────────────────┐  │   │
+│  │  │           WASM Sandbox (Wasmtime)         │  │   │
+│  │  │  ┌─────────────────────────────────────┐  │  │   │
+│  │  │  │         Untrusted WASM Code         │  │  │   │
+│  │  │  │         (capability-bounded)        │  │  │   │
+│  │  │  └─────────────────────────────────────┘  │  │   │
+│  │  └───────────────────────────────────────────┘  │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+### Guarantees
+
+1. **Termination**: Fuel exhaustion guarantees termination
+2. **Memory Safety**: WASM linear memory is bounds-checked
+3. **Isolation**: No shared state between executions
+4. **Capability Restriction**: Only granted capabilities accessible
+5. **Forensic Preservation**: Failures are captured for audit
+
+### Non-Guarantees
+
+1. **Timing**: Execution time is bounded but not constant
+2. **Side Channels**: CPU cache timing attacks are possible
+3. **Resource Exhaustion**: Memory allocation before instantiation
+4. **Host Function Safety**: Custom host functions must be secure
